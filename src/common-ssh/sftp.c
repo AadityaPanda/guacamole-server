@@ -31,6 +31,7 @@
 
 #include <fcntl.h>
 #include <libgen.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -583,6 +584,186 @@ void guac_common_ssh_sftp_set_upload_path(
 
 }
 
+/*
+ * File details in directory listings.
+ *
+ * Upstream writes each directory entry as `"<path>": "<mimetype>"` and drops
+ * the attributes SFTP already returned with it. The helpers below write
+ * `"<path>": {"mime": ..., "size": ..., "mtime": ..., "mode": ...,
+ * "owner": ..., "group": ...}` instead, so the browser can show size,
+ * modified time, permissions and owner without a second connection. Only
+ * fields the server actually supplied are written. Clients must accept both
+ * forms; stock guacamole-client accepts only the mimetype string.
+ */
+
+/**
+ * Renders SFTP permission bits as an ls-style string ("-rw-r--r--").
+ *
+ * @param permissions
+ *     The permissions field of LIBSSH2_SFTP_ATTRIBUTES.
+ *
+ * @param mode
+ *     Output buffer of at least 11 bytes.
+ */
+static void guac_common_ssh_sftp_mode_string(unsigned long permissions,
+        char* mode) {
+
+    const char* rwx = "rwxrwxrwx";
+    int i;
+
+    if (LIBSSH2_SFTP_S_ISDIR(permissions))       mode[0] = 'd';
+    else if (LIBSSH2_SFTP_S_ISLNK(permissions))  mode[0] = 'l';
+    else if (LIBSSH2_SFTP_S_ISCHR(permissions))  mode[0] = 'c';
+    else if (LIBSSH2_SFTP_S_ISBLK(permissions))  mode[0] = 'b';
+    else if (LIBSSH2_SFTP_S_ISFIFO(permissions)) mode[0] = 'p';
+    else if (LIBSSH2_SFTP_S_ISSOCK(permissions)) mode[0] = 's';
+    else                                         mode[0] = '-';
+
+    for (i = 0; i < 9; i++)
+        mode[i + 1] = (permissions & (0400 >> i)) ? rwx[i] : '-';
+
+    mode[10] = '\0';
+
+}
+
+/**
+ * Copies the whitespace-separated field at the given index out of the
+ * server's `ls -l` style long entry - the only place SFTP (v3) carries owner
+ * and group NAMES; the attributes hold numeric ids only. Index 2 is the
+ * owner, 3 the group.
+ *
+ * @return
+ *     Non-zero if the field was found and copied, zero otherwise.
+ */
+static int guac_common_ssh_sftp_longentry_field(const char* longentry,
+        int index, char* field, int field_size) {
+
+    const char* current = longentry;
+    int i;
+
+    for (i = 0; *current != '\0'; i++) {
+
+        /* Skip separating whitespace */
+        while (*current == ' ' || *current == '\t')
+            current++;
+
+        if (*current == '\0')
+            break;
+
+        const char* start = current;
+        while (*current != '\0' && *current != ' ' && *current != '\t')
+            current++;
+
+        if (i == index) {
+            int length = current - start;
+            if (length <= 0 || length >= field_size)
+                return 0;
+            memcpy(field, start, length);
+            field[length] = '\0';
+            return 1;
+        }
+
+    }
+
+    return 0;
+
+}
+
+/**
+ * Writes one directory entry as `"<path>": {<details>}`, mirroring
+ * guac_common_json_write_property() (leading comma, property count) so the
+ * surrounding stream/blob flow control is unchanged.
+ *
+ * @return
+ *     Non-zero if at least one blob was written (the caller must wait for
+ *     the next ack), zero otherwise.
+ */
+static int guac_common_ssh_sftp_write_entry(guac_user* user,
+        guac_stream* stream, guac_common_json_state* json_state,
+        const char* path, const char* mimetype,
+        const LIBSSH2_SFTP_ATTRIBUTES* attributes, const char* longentry) {
+
+    int blob_written = 0;
+    char buffer[64];
+    char field[256];
+
+    /* Only trust the long entry's columns if it is ls-shaped */
+    int has_longentry = strchr("-dlcbps", longentry[0]) != NULL
+        && longentry[0] != '\0';
+
+    if (json_state->properties_written != 0)
+        blob_written |= guac_common_json_write(user, stream,
+                json_state, ",", 1);
+
+    blob_written |= guac_common_json_write_string(user, stream,
+            json_state, path);
+
+    blob_written |= guac_common_json_write(user, stream,
+            json_state, ":{\"mime\":", 9);
+
+    blob_written |= guac_common_json_write_string(user, stream,
+            json_state, mimetype);
+
+    if (attributes->flags & LIBSSH2_SFTP_ATTR_SIZE) {
+        snprintf(buffer, sizeof(buffer), ",\"size\":%llu",
+                (unsigned long long) attributes->filesize);
+        blob_written |= guac_common_json_write(user, stream,
+                json_state, buffer, strlen(buffer));
+    }
+
+    if (attributes->flags & LIBSSH2_SFTP_ATTR_ACMODTIME) {
+        snprintf(buffer, sizeof(buffer), ",\"mtime\":%lu",
+                (unsigned long) attributes->mtime);
+        blob_written |= guac_common_json_write(user, stream,
+                json_state, buffer, strlen(buffer));
+    }
+
+    if (attributes->flags & LIBSSH2_SFTP_ATTR_PERMISSIONS) {
+        guac_common_ssh_sftp_mode_string(attributes->permissions, field);
+        blob_written |= guac_common_json_write(user, stream,
+                json_state, ",\"mode\":", 8);
+        blob_written |= guac_common_json_write_string(user, stream,
+                json_state, field);
+    }
+
+    /* Owner / group: names from the long entry, else the numeric ids */
+    if (has_longentry && guac_common_ssh_sftp_longentry_field(longentry, 2,
+                field, sizeof(field))) {
+        blob_written |= guac_common_json_write(user, stream,
+                json_state, ",\"owner\":", 9);
+        blob_written |= guac_common_json_write_string(user, stream,
+                json_state, field);
+    }
+    else if (attributes->flags & LIBSSH2_SFTP_ATTR_UIDGID) {
+        snprintf(buffer, sizeof(buffer), ",\"owner\":\"%lu\"",
+                (unsigned long) attributes->uid);
+        blob_written |= guac_common_json_write(user, stream,
+                json_state, buffer, strlen(buffer));
+    }
+
+    if (has_longentry && guac_common_ssh_sftp_longentry_field(longentry, 3,
+                field, sizeof(field))) {
+        blob_written |= guac_common_json_write(user, stream,
+                json_state, ",\"group\":", 9);
+        blob_written |= guac_common_json_write_string(user, stream,
+                json_state, field);
+    }
+    else if (attributes->flags & LIBSSH2_SFTP_ATTR_UIDGID) {
+        snprintf(buffer, sizeof(buffer), ",\"group\":\"%lu\"",
+                (unsigned long) attributes->gid);
+        blob_written |= guac_common_json_write(user, stream,
+                json_state, buffer, strlen(buffer));
+    }
+
+    blob_written |= guac_common_json_write(user, stream,
+            json_state, "}", 1);
+
+    json_state->properties_written++;
+
+    return blob_written;
+
+}
+
 /**
  * Handler for ack messages received due to receipt of a "body" or "blob"
  * instruction associated with a SFTP directory list operation.
@@ -610,6 +791,7 @@ static int guac_common_ssh_sftp_ls_ack_handler(guac_user* user,
     int bytes_read;
 
     char filename[GUAC_COMMON_SSH_SFTP_MAX_PATH];
+    char longentry[GUAC_COMMON_SSH_SFTP_MAX_PATH];
     LIBSSH2_SFTP_ATTRIBUTES attributes;
 
     guac_common_ssh_sftp_ls_state* list_state =
@@ -628,8 +810,11 @@ static int guac_common_ssh_sftp_ls_ack_handler(guac_user* user,
     }
 
     /* While directory entries remain */
-    while ((bytes_read = libssh2_sftp_readdir(list_state->directory,
-                filename, sizeof(filename), &attributes)) > 0) {
+    /* readdir_ex also returns the ls-style long entry,
+     * which carries owner/group names (see write_entry above) */
+    while ((bytes_read = libssh2_sftp_readdir_ex(list_state->directory,
+                filename, sizeof(filename), longentry, sizeof(longentry),
+                &attributes)) > 0) {
 
         char absolute_path[GUAC_COMMON_SSH_SFTP_MAX_PATH];
 
@@ -659,9 +844,12 @@ static int guac_common_ssh_sftp_ls_ack_handler(guac_user* user,
         else
             mimetype = "application/octet-stream";
 
-        /* Write entry, waiting for next ack if a blob is written */
-        if (guac_common_json_write_property(user, stream,
-                    &list_state->json_state, absolute_path, mimetype))
+        /* Write entry, waiting for next ack if a blob is written.
+         * The value is an object with details, not the bare
+         * mimetype string. */
+        if (guac_common_ssh_sftp_write_entry(user, stream,
+                    &list_state->json_state, absolute_path, mimetype,
+                    &attributes, longentry))
             break;
 
     }

@@ -30,8 +30,81 @@
 #include <winpr/nt.h>
 #include <winpr/shell.h>
 
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/*
+ * File details in RDP drive listings.
+ *
+ * Same entry format as the SFTP listings in src/common-ssh/sftp.c:
+ * `"<path>": {"mime": ..., "size": ..., "mtime": ...}`. The drive is a
+ * directory on the guacd host, so permissions and ownership (all guacd's own
+ * service user) carry no meaning here and are not sent. Size is sent for
+ * files only; mtime only when known.
+ */
+
+/**
+ * Seconds between the Windows epoch (1601-01-01) and the UNIX epoch - the
+ * inverse of WINDOWS_TIME() in fs.h, which stores times as 100-nanosecond
+ * intervals since 1601.
+ */
+#define GUAC_RDP_LS_EPOCH_DELTA ((uint64_t) 11644473600)
+
+/**
+ * Writes one directory entry as `"<path>": {<details>}`, mirroring
+ * guac_common_json_write_property() (leading comma, property count) so the
+ * surrounding stream/blob flow control is unchanged.
+ *
+ * @return
+ *     Non-zero if at least one blob was written, zero otherwise.
+ */
+static int guac_rdp_ls_write_entry(guac_user* user, guac_stream* stream,
+        guac_common_json_state* json_state, const char* path,
+        const char* mimetype, const guac_rdp_fs_file* file) {
+
+    int blob_written = 0;
+    char buffer[64];
+
+    if (json_state->properties_written != 0)
+        blob_written |= guac_common_json_write(user, stream,
+                json_state, ",", 1);
+
+    blob_written |= guac_common_json_write_string(user, stream,
+            json_state, path);
+
+    blob_written |= guac_common_json_write(user, stream,
+            json_state, ":{\"mime\":", 9);
+
+    blob_written |= guac_common_json_write_string(user, stream,
+            json_state, mimetype);
+
+    /* Size is meaningful for files only */
+    if (!(file->attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        snprintf(buffer, sizeof(buffer), ",\"size\":%llu",
+                (unsigned long long) file->size);
+        blob_written |= guac_common_json_write(user, stream,
+                json_state, buffer, strlen(buffer));
+    }
+
+    /* A zero Windows timestamp means the time is unknown */
+    if (file->mtime != 0) {
+        snprintf(buffer, sizeof(buffer), ",\"mtime\":%llu",
+                (unsigned long long) (file->mtime / 10000000
+                    - GUAC_RDP_LS_EPOCH_DELTA));
+        blob_written |= guac_common_json_write(user, stream,
+                json_state, buffer, strlen(buffer));
+    }
+
+    blob_written |= guac_common_json_write(user, stream,
+            json_state, "}", 1);
+
+    json_state->properties_written++;
+
+    return blob_written;
+
+}
 
 int guac_rdp_ls_ack_handler(guac_user* user, guac_stream* stream,
         char* message, guac_protocol_status status) {
@@ -92,9 +165,10 @@ int guac_rdp_ls_ack_handler(guac_user* user, guac_stream* stream,
         else
             mimetype = "application/octet-stream";
 
-        /* Write entry */
-        blob_written |= guac_common_json_write_property(user, stream,
-                &ls_status->json_state, absolute_path, mimetype);
+        /* Write entry: an object value with size and
+         * modification time, not the bare mimetype string. */
+        blob_written |= guac_rdp_ls_write_entry(user, stream,
+                &ls_status->json_state, absolute_path, mimetype, file);
 
         guac_rdp_fs_close(ls_status->fs, file_id);
 
